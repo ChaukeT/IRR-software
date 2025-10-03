@@ -1,0 +1,10 @@
+# Python 3.10+
+PySide6>=6.7
+numpy>=2.0
+pandas>=2.2
+ortools>=9.10
+
+
+# Optional (only if you keep the external backend enabled)
+# mpi4py>=3.1
+# (Your external solver binary is not a pip dependency.)
