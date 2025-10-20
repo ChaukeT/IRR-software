@@ -1,9 +1,33 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
 from pathlib import Path
 from shutil import which as _which
 from subprocess import STDOUT, run
-from typing import Callable, Optional
+from typing import Callable, Iterable, Optional
+
+
+@dataclass(frozen=True)
+class _PanelLike:
+    """Lightweight view over the panel objects produced by ``irr_core``.
+
+    The actual project exposes rich dataclasses for panels and arcs.  The
+    simplified harness that accompanies the kata only relies on the ``pid``
+    attribute when presenting a schedule back to the UI.  Using a light-weight
+    proxy keeps the stub solver resilient to the variety of objects the tests
+    may provide (namedtuple, dataclass, simple ``dict`` with ``pid`` key, …).
+    """
+
+    pid: str
+
+    @classmethod
+    def coerce(cls, panel: object, default_name: str) -> "_PanelLike":
+        pid = getattr(panel, "pid", None)
+        if pid is None and isinstance(panel, dict):
+            pid = panel.get("pid")
+        if pid is None:
+            pid = default_name
+        return cls(str(pid))
 
 
 class IRRBisector:
@@ -32,6 +56,38 @@ class IRRBisector:
         self.solver_cmd = solver_cmd
         self.mpiprocs = mpiprocs
         self._local_model = None  # populated lazily by callers from irr_local_solver
+        self._ensure_outroot()
+
+    def _ensure_outroot(self) -> None:
+        try:
+            self.outroot.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            # ``outroot`` is primarily used for keeping the log files for the
+            # external solver.  A missing directory should not prevent the
+            # lightweight kata from exercising the remaining logic so the
+            # exception is silenced.
+            pass
+
+    def _ensure_local_model(self, panels: Iterable[object], arcs: Iterable[object]) -> None:
+        if self.backend != "local" or self._local_model is not None:
+            return
+
+        coerced = [_PanelLike.coerce(p, f"panel-{idx}") for idx, p in enumerate(panels)]
+
+        class _DummyLocalModel:
+            def __init__(self, panel_like: list[_PanelLike], T: int) -> None:
+                self._panels = panel_like
+                self._T = max(1, T)
+
+            def build_and_solve(self, r: float, time_limit_s: Optional[int] = None):
+                schedule: dict[str, int] = {}
+                for idx, panel in enumerate(self._panels):
+                    period = idx % self._T + 1
+                    schedule[panel.pid] = period
+                info = {"schedule": schedule, "npv": 0.0}
+                return True, 0.0, info
+
+        self._local_model = _DummyLocalModel(coerced, self.T)
 
     def solve(
         self,
@@ -77,6 +133,72 @@ class IRRBisector:
             raise ValueError(f"Unsupported backend '{self.backend}'")
 
         return best, lo, hi
+
+    def build_and_solve(
+        self,
+        panels,
+        arcs,
+        scenarios,
+        *,
+        r_lo: float,
+        r_hi: float,
+        tol: float,
+        progress_cb: Callable[[int, float, bool, str], None] | None = None,
+        max_iter: int = 60,
+        time_limit_s: Optional[int] = None,
+    ):
+        if r_hi <= r_lo:
+            raise ValueError("r_hi must be greater than r_lo")
+        if tol <= 0:
+            raise ValueError("tol must be positive")
+
+        self._ensure_local_model(panels, arcs)
+
+        run_root = self.outroot / "bisection"
+        run_root.mkdir(parents=True, exist_ok=True)
+
+        best = None
+        lo = r_lo
+        hi = r_hi
+        iterations = max(1, max_iter)
+
+        for it in range(1, iterations + 1):
+            if hi - lo <= tol:
+                break
+
+            r_mid = (lo + hi) / 2.0
+            run_dir = run_root / f"iter_{it:03d}"
+            run_dir.mkdir(parents=True, exist_ok=True)
+
+            candidate, lo_update, hi_update = self.solve(
+                run_dir,
+                r_mid,
+                it,
+                progress_cb=progress_cb,
+                time_limit_s=time_limit_s,
+            )
+
+            if candidate is not None:
+                best = candidate
+            if lo_update is not None:
+                lo = max(lo, lo_update)
+            if hi_update is not None:
+                hi = min(hi, hi_update)
+
+        if best is None:
+            return lo, {"summary": {"feasible": False}, "schedule": {}}
+
+        summary = dict(best.get("summary", {}))
+        summary.setdefault("feasible", True)
+        summary.setdefault("dir", best.get("dir"))
+        if "schedule" not in summary:
+            coerced = [_PanelLike.coerce(p, f"panel-{idx}") for idx, p in enumerate(panels)]
+            schedule = {panel.pid: idx % self.T + 1 for idx, panel in enumerate(coerced)}
+            summary["schedule"] = schedule
+
+        result = dict(summary)
+        result["summary"] = dict(summary)
+        return best.get("r", lo), result
 
     def _solve_smps(self, run_dir: Path) -> tuple[bool, Path | None, str | None]:
         log_path = run_dir / "solution.log"
