@@ -3,6 +3,7 @@ PySide6>=6.7
 numpy>=2.0
 pandas>=2.2
 ortools>=9.10
+matplotlib>=3.8
 
 
 # Optional (only if you keep the external backend enabled)
